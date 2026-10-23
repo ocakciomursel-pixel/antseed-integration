@@ -1,11 +1,5 @@
 import { GdCreditEntry } from "./types";
 
-export type CreditBonusInput = {
-  principalUsd: bigint;
-  monthlyStreamCapUsd: bigint;
-  streamingBonusUsedUsd: bigint;
-};
-
 export type CreditBonusResult = {
   principalUsd: bigint;
   bonusUsd: bigint;
@@ -54,6 +48,3 @@ export function monthKey(date = new Date()): string {
   return date.toISOString().slice(0, 7);
 }
 
-function min(a: bigint, b: bigint): bigint {
-  return a < b ? a : b;
-}

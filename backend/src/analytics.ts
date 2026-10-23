@@ -4,6 +4,7 @@ import { base, celo } from "viem/chains";
 import { decodeBuyerFromUserData } from "./celo-events.js";
 import { Env } from "./env.js";
 import { errorMessage, logError, logInfo, logWarn, redactAddress } from "./logging.js";
+import { SUPERFLUID_CELO_SUBGRAPH_URL } from "./stream-periods.js";
 
 type KV = Pick<KVNamespace, "get" | "put">;
 
@@ -14,8 +15,16 @@ type StreamSnapshot = {
   totalStreamedWei: bigint;
 };
 
+type FinalizedDayContribution = {
+  gdOneTimeDepositsWei: string;
+  gdStreamedWei: string;
+  aiCreditsUsedWei: string;
+};
+
 type AnalyticsState = {
   finalizedThroughDate?: string;
+  finalizedDays?: Record<string, FinalizedDayContribution>;
+  missingDates?: string[];
   updatedAt: string;
 };
 
@@ -143,27 +152,25 @@ export async function runAnalyticsAggregation(env: Env, runAt = new Date()): Pro
   const knownBuyers = await store.getBuyerRegistry();
   const discoveredBuyers = new Set<string>();
 
-  console.log("Collecting celo metrics...");
+  logInfo("analytics.celo.collect");
   const celoMetrics = await collectCeloDayMetrics(cfg, celoClient, dayWindow, aggregate, discoveredBuyers);
-  console.log("Collecting stream metrics...");
+  logInfo("analytics.streams.collect");
   const streamMetrics = await collectStreamDayMetrics(cfg, dayWindow, aggregate, windowEnd, discoveredBuyers);
   if (discoveredBuyers.size > 0) {
     await store.addBuyersToRegistry([...discoveredBuyers]);
     for (const buyer of discoveredBuyers) knownBuyers.add(buyer);
   }
-  logInfo("getting base metrics....");
+  logInfo("analytics.base.collect");
   const baseMetrics = await collectBaseDayMetrics(cfg, baseClient, dayWindow, aggregate, knownBuyers);
-  logInfo("building dialy reocrd....");
+  logInfo("analytics.daily.build");
 
   const dailyRecord = buildDailyRecord(currentDate, aggregate, windowEnd);
   await store.replaceDaily(currentDate, dailyRecord, [...aggregate.gdBuyers], [...aggregate.creditUsers]);
-  const latestState = await store.getState();
-  await store.putState({
-    finalizedThroughDate: latestState?.finalizedThroughDate,
-    updatedAt: windowEnd.toISOString()
-  });
+  const latestState: AnalyticsState = (await store.getState()) ?? state;
+  const updatedState = await reconcileReaggregatedDay(store, latestState, currentDate, dailyRecord, windowEnd);
+  await store.putState(updatedState);
 
-  const finalizedDates = await finalizeClosedDays(store, state, runDay, runAt);
+  const finalizedDates = await finalizeClosedDays(store, updatedState, runDay, runAt);
   logInfo("analytics.sync.end", {
     currentDate,
     finalizedDates,
@@ -213,10 +220,19 @@ export async function getAnalyticsWindow(env: Env, days = 30, now = new Date()):
     store.getState()
   ]);
 
-  // The last fetched day is currentDate's record, so no need to re-read it from KV.
-  const today = daily[daily.length - 1];
-  const global = addDailyToGlobal(persistedGlobal, today, now.toISOString());
   const resolvedState = state ?? { updatedAt: now.toISOString() };
+  const today = daily[daily.length - 1];
+  let global: AnalyticsGlobalTotals = {
+    ...persistedGlobal,
+    gdTotalFlowRateWeiPerSecond: BigInt(today?.gdTotalFlowRateWeiPerSecond ?? "0").toString(),
+    updatedAt: now.toISOString()
+  };
+  for (const day of daily) {
+    if (!isDayFinalized(resolvedState, day.date)) {
+      global = addDailyToGlobal(global, day, now.toISOString());
+    }
+  }
+  global.gdTotalFlowRateWeiPerSecond = BigInt(today?.gdTotalFlowRateWeiPerSecond ?? "0").toString();
 
   return {
     days: normalizedDays,
@@ -326,7 +342,59 @@ function analyticsConfigFromEnv(env: Env): AnalyticsConfig {
     baseChannelsAddress: (env.ANTSEED_CHANNELS_ADDRESS ?? "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d").toLowerCase(),
     celoSuperTokenAddress: env.CELO_GD_SUPERTOKEN_ADDRESS?.toLowerCase(),
     celoStreamReceiverAddress: env.CELO_VAULT_ADDRESS?.toLowerCase(),
-    superfluidSubgraphUrl: env.SUPERFLUID_SUBGRAPH_URL ?? "https://celo-mainnet.subgraph.x.superfluid.dev/"
+    superfluidSubgraphUrl: env.SUPERFLUID_SUBGRAPH_URL ?? SUPERFLUID_CELO_SUBGRAPH_URL
+  };
+}
+
+function isDayFinalized(state: AnalyticsState, date: string): boolean {
+  if (state.finalizedDays && date in state.finalizedDays) return true;
+  if (state.missingDates?.includes(date)) return false;
+  if (state.finalizedThroughDate && date <= state.finalizedThroughDate) return true;
+  return false;
+}
+
+async function reconcileReaggregatedDay(
+  store: KVAnalyticsStore,
+  state: AnalyticsState,
+  date: string,
+  day: AnalyticsDailyRecord,
+  now: Date
+): Promise<AnalyticsState> {
+  const finalizedDays = { ...(state.finalizedDays ?? {}) };
+  const missingSet = new Set(state.missingDates ?? []);
+  const previousContribution = finalizedDays[date];
+  const wasFinalizedWithoutLedger =
+    !previousContribution && Boolean(state.finalizedThroughDate && date <= state.finalizedThroughDate && !missingSet.has(date));
+
+  if (previousContribution || wasFinalizedWithoutLedger) {
+    const global = await store.getGlobal();
+    const prevDeposits = BigInt(previousContribution?.gdOneTimeDepositsWei ?? "0");
+    const prevStreamed = BigInt(previousContribution?.gdStreamedWei ?? "0");
+    const prevCredits = BigInt(previousContribution?.aiCreditsUsedWei ?? "0");
+
+    const baseDeposits = BigInt(global.gdOneTimeDepositsWei) >= prevDeposits ? BigInt(global.gdOneTimeDepositsWei) - prevDeposits : 0n;
+    const baseStreamed = BigInt(global.gdStreamedWei) >= prevStreamed ? BigInt(global.gdStreamedWei) - prevStreamed : 0n;
+    const baseCredits = BigInt(global.aiCreditsUsedWei) >= prevCredits ? BigInt(global.aiCreditsUsedWei) - prevCredits : 0n;
+
+    await store.putGlobal({
+      gdOneTimeDepositsWei: (baseDeposits + BigInt(day.gdOneTimeDepositsWei)).toString(),
+      gdStreamedWei: (baseStreamed + BigInt(day.gdStreamedWei)).toString(),
+      aiCreditsUsedWei: (baseCredits + BigInt(day.aiCreditsUsedWei)).toString(),
+      gdTotalFlowRateWeiPerSecond: global.gdTotalFlowRateWeiPerSecond,
+      updatedAt: now.toISOString()
+    });
+    finalizedDays[date] = {
+      gdOneTimeDepositsWei: day.gdOneTimeDepositsWei,
+      gdStreamedWei: day.gdStreamedWei,
+      aiCreditsUsedWei: day.aiCreditsUsedWei
+    };
+  }
+
+  return {
+    finalizedThroughDate: state.finalizedThroughDate,
+    finalizedDays,
+    missingDates: [...missingSet],
+    updatedAt: now.toISOString()
   };
 }
 
@@ -335,41 +403,65 @@ async function finalizeClosedDays(store: KVAnalyticsStore, state: AnalyticsState
   const yesterday = previousDate(currentDate);
   if (!yesterday) return finalizedDates;
 
-  const startDate = state.finalizedThroughDate ? nextDate(state.finalizedThroughDate) : yesterday;
-  if (!startDate) {
-    return finalizedDates;
-  }
-
-  if (startDate > yesterday) {
-    return finalizedDates;
-  }
-
+  const finalizedDays = { ...(state.finalizedDays ?? {}) };
+  const missingSet = new Set(state.missingDates ?? []);
   let global = await store.getGlobal();
-  let cursor = startDate;
-  while (cursor <= yesterday) {
-    const day = await store.getDaily(cursor);
-    //dont finalize if a day is missing
-    if (day.missing) {
-      // log warning
-      logWarn("analytics.finalize.skipped", {
-        reason: "missing_daily_record",
-        date: cursor
-      });
-      break;
-    }
+  let latestScannedDate = state.finalizedThroughDate;
+
+  // First repair any previously skipped missing dates that now have records.
+  for (const missingDate of [...missingSet].sort()) {
+    if (missingDate > yesterday) continue;
+    const day = await store.getDaily(missingDate);
+    if (day.missing) continue;
     global = addDailyToGlobal(global, day, now.toISOString());
-    finalizedDates.push(cursor);
-    const next = nextDate(cursor);
-    if (!next) break;
-    cursor = next;
+    finalizedDays[missingDate] = {
+      gdOneTimeDepositsWei: day.gdOneTimeDepositsWei,
+      gdStreamedWei: day.gdStreamedWei,
+      aiCreditsUsedWei: day.aiCreditsUsedWei
+    };
+    missingSet.delete(missingDate);
+    finalizedDates.push(missingDate);
   }
 
-  await store.putGlobal(global);
-  const finalizedThroughDate = finalizedDates.length > 0 ? finalizedDates[finalizedDates.length - 1] : state.finalizedThroughDate;
-  await store.putState({
-    finalizedThroughDate,
-    updatedAt: now.toISOString()
-  });
+  const startDate = state.finalizedThroughDate ? nextDate(state.finalizedThroughDate) : yesterday;
+  if (startDate && startDate <= yesterday) {
+    let cursor: string | undefined = startDate;
+    while (cursor && cursor <= yesterday) {
+      latestScannedDate = cursor;
+      const day = await store.getDaily(cursor);
+      if (day.missing) {
+        logWarn("analytics.finalize.skipped", {
+          reason: "missing_daily_record",
+          date: cursor
+        });
+        missingSet.add(cursor);
+      } else if (!finalizedDays[cursor]) {
+        global = addDailyToGlobal(global, day, now.toISOString());
+        finalizedDays[cursor] = {
+          gdOneTimeDepositsWei: day.gdOneTimeDepositsWei,
+          gdStreamedWei: day.gdStreamedWei,
+          aiCreditsUsedWei: day.aiCreditsUsedWei
+        };
+        missingSet.delete(cursor);
+        finalizedDates.push(cursor);
+      }
+      cursor = nextDate(cursor);
+    }
+  }
+
+  if (finalizedDates.length > 0 || latestScannedDate !== state.finalizedThroughDate || missingSet.size !== (state.missingDates?.length ?? 0)) {
+    await store.putGlobal(global);
+    const finalizedThroughDate =
+      finalizedDates.length > 0 && (!latestScannedDate || finalizedDates[finalizedDates.length - 1] >= latestScannedDate)
+        ? finalizedDates[finalizedDates.length - 1]
+        : latestScannedDate ?? state.finalizedThroughDate;
+    await store.putState({
+      finalizedThroughDate,
+      finalizedDays,
+      missingDates: [...missingSet].sort(),
+      updatedAt: now.toISOString()
+    });
+  }
   return finalizedDates;
 }
 
@@ -534,29 +626,35 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
 
   const snapshotsBySender = new Map<string, { buyerAddress?: string; flowRateWeiPerSecond: bigint; totalStreamedWei: bigint }>();
   const pageSize = 1000;
-  let skip = 0;
+  let lastId = "";
+  let pageIndex = 0;
   const nowUnix = Math.floor(now.getTime() / 1000);
 
-  // get streams that are either active or stopped within the day window
+  // get streams that are either active or stopped within the day window using keyset pagination on id
   let body = {};
   while (true) {
     body = {
       query: `
-        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!,$until:BigInt!, $first: Int!, $skip: Int!) {
+        query StreamPeriodsPage($receiver: String!, $token: String!, $daysago: BigInt!, $until: BigInt!, $lastId: String!, $first: Int!) {
           streamPeriods(
+            first: $first
+            orderBy: id
+            orderDirection: asc
             where: {
               or: [
-                { receiver: $receiver, token: $token, stoppedAtTimestamp: null, startedAtTimestamp_lte: $until },
-                { receiver: $receiver, token: $token, stoppedAtTimestamp_gt: $daysago, startedAtTimestamp_lte: $until }
+                { receiver: $receiver, token: $token, id_gt: $lastId, stoppedAtTimestamp: null, startedAtTimestamp_lte: $until },
+                { receiver: $receiver, token: $token, id_gt: $lastId, stoppedAtTimestamp_gt: $daysago, startedAtTimestamp_lte: $until }
               ]
             }
-            first: $first
-            skip: $skip
           ) {
+            id
             sender { id }
             flowRate
             startedAtTimestamp
             stoppedAtTimestamp
+            startedAtEvent {
+              userData
+            }
             stream {
               userData
             }
@@ -568,37 +666,43 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
         token: cfg.celoSuperTokenAddress,
         daysago: String(dayStartUnix),
         until: String(dayEndUnix),
+        lastId,
         first: pageSize,
-        skip
+        skip: pageIndex * pageSize
       }
     };
 
     const response = await retryWithBackoff(
-      () =>
-        fetch(cfg.superfluidSubgraphUrl, {
+      async () => {
+        const res = await fetch(cfg.superfluidSubgraphUrl, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify(body)
-        }),
+        });
+        if (!res.ok) {
+          throw new Error(`Superfluid subgraph HTTP ${res.status}`);
+        }
+        return res;
+      },
       3,
       500
     );
-
-    if (!response.ok) {
-      throw new Error(`Superfluid subgraph HTTP ${response.status}`);
-    }
 
     const json = (await response.json()) as {
       errors?: Array<any>;
       data?: {
         streamPeriods?: Array<{
+          id?: string;
           sender: { id: string };
           flowRate: string;
           startedAtTimestamp: string;
           stoppedAtTimestamp: string | null;
-          stream: {
-            userData: string;
-          };
+          startedAtEvent?: {
+            userData?: string;
+          } | null;
+          stream?: {
+            userData?: string;
+          } | null;
         }>;
       };
     };
@@ -618,7 +722,7 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
       const flowRate = BigInt(period.flowRate || "0");
       const startedAt = parseNumberish(period.startedAtTimestamp || "0");
       const stoppedAt = period.stoppedAtTimestamp ? parseNumberish(period.stoppedAtTimestamp) : null;
-      const buyerAddress = decodeBuyerFromUserData(period.stream.userData);
+      const buyerAddress = decodeBuyerFromUserData(period.startedAtEvent?.userData ?? period.stream?.userData);
 
       // intersect period with the day window to get seconds streamed today
       const effectiveStart = Math.max(startedAt, dayStartUnix);
@@ -641,7 +745,10 @@ async function fetchStreamSnapshots(cfg: AnalyticsConfig, now: Date, dayStartUni
     }
 
     if (batch.length < pageSize) break;
-    skip += pageSize;
+    const nextLastId = batch[batch.length - 1]?.id;
+    if (!nextLastId || nextLastId === lastId) break;
+    lastId = nextLastId;
+    pageIndex += 1;
   }
 
   return [...snapshotsBySender.entries()].map(([sender, value]) => ({
@@ -763,10 +870,17 @@ async function getChainRpcUrls(kv: KV, chainId: number, fallbackRpcs: string[]):
 async function fetchRpcsFromChainlist(chainId: number): Promise<string[]> {
   const chainlistUrl = new URL(CHAINLIST_RPCS_URL);
 
-  const response = await retryWithBackoff(() => fetch(chainlistUrl.href), 3, 500);
-  if (!response.ok) {
-    throw new Error(`Chainlist HTTP ${response.status}`);
-  }
+  const response = await retryWithBackoff(
+    async () => {
+      const res = await fetch(chainlistUrl.href);
+      if (!res.ok) {
+        throw new Error(`Chainlist HTTP ${res.status}`);
+      }
+      return res;
+    },
+    3,
+    500
+  );
 
   const payload = (await response.json()) as Array<{
     chainId?: number;
@@ -774,7 +888,7 @@ async function fetchRpcsFromChainlist(chainId: number): Promise<string[]> {
   }>;
 
   const chain = payload.find((entry) => entry.chainId === chainId);
-  console.log("got rpcs from chainlist", { chainId });
+  logInfo("analytics.rpc.chainlist_fetched", { chainId });
 
   if (!chain?.rpc) {
     return [];
@@ -881,10 +995,17 @@ async function getBlockByTimestamp(apiUrl: string, timestamp: number, closest: "
   url.searchParams.set("timestamp", String(timestamp));
   url.searchParams.set("closest", closest);
 
-  const response = await retryWithBackoff(() => fetch(url.href), 3, 300);
-  if (!response.ok) {
-    throw new Error(`Explorer HTTP ${response.status}`);
-  }
+  const response = await retryWithBackoff(
+    async () => {
+      const res = await fetch(url.href);
+      if (!res.ok) {
+        throw new Error(`Explorer HTTP ${res.status}`);
+      }
+      return res;
+    },
+    3,
+    300
+  );
 
   const payload = (await response.json()) as {
     status?: string;

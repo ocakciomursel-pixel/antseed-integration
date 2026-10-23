@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { configFromEnv } from "../src/env.js";
 import { KVCreditStore } from "../src/kv-credit-store.js";
 
 class MemoryKV {
@@ -548,4 +549,44 @@ test("recordStreamFlowRate does not mirror the rate onto the root account", asyn
   assert.equal((await store.getUser("0xROOT")).streamFlowRateWeiPerSecond, "0", "the root's rate is the cron's sum, not a mirror");
   // The totals still aggregate on the root, which is what mirroring is for.
   assert.equal((await store.getUser("0xROOT")).totalGDStreamedWei, "1000000000000000000");
+});
+
+
+test("configFromEnv scales MAX_BONUS_CAP_USD in 6-decimal USDC micro-units and caps monthly bonus at $100", async () => {
+  const kv = new MemoryKV();
+  const cfg = configFromEnv({ ANTSEED_KV: kv as never });
+  assert.equal(cfg.MAX_BONUS_CAP_USD, 100_000_000n);
+
+  const store = new KVCreditStore(kv as never);
+  const entry = await store.recordGdCredit({
+    id: "deposit:env-cap",
+    account: "0xABC",
+    rootAccount: "0xROOT",
+    source: "deposit",
+    gdAmountWei: 2_000_000_000_000_000_000_000n, // 2000 G$ at $1 = $2000 principal -> $200 raw 10% bonus
+    gdPrice: GD_PRICE,
+    isVerified: true,
+    maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD
+  });
+
+  assert.equal(entry.principalUsd, "2000000000");
+  assert.equal(entry.bonusUsd, "100000000"); // capped at $100 (100_000_000 micro-USD)
+});
+
+test("recordGdCredit retains more than 500 credit entries in the account index", async () => {
+  const store = new KVCreditStore(new MemoryKV() as never);
+  for (let i = 0; i < 505; i += 1) {
+    await store.recordGdCredit({
+      id: `deposit:many:${i}`,
+      account: "0xMANY",
+      source: "deposit",
+      gdAmountWei: 1_000_000_000_000_000_000n,
+      gdPrice: GD_PRICE,
+      isVerified: false,
+      maxBonusCapUsd: 100_000_000n
+    });
+  }
+
+  const credits = await store.getGdCredits("0xMANY");
+  assert.equal(credits.length, 505);
 });

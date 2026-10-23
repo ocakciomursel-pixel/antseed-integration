@@ -41,15 +41,6 @@ const CeloEventsRecordSchema = z
   .refine((value) => Boolean(value.txHash || (value.account && value.fromBlock)), {
     message: "provide txHash or account+fromBlock"
   });
-const StreamUpdateSchema = z.object({
-  account: z.string().min(1),
-  rootAccount: z.string().min(1).optional(),
-  flowRateWeiPerSecond: z.string().regex(/^\d+$/),
-  monthlyGdAmountWei: z.string().regex(/^\d+$/).optional(),
-  txHash: z.string().optional(),
-  logIndex: z.number().int().nonnegative().optional()
-});
-
 const WithdrawPrincipalSchema = z.object({
   amount: z.string().regex(/^\d+$/),
   recipient: z.string().regex(/^0x[0-9a-fA-F]{40}$/),
@@ -75,11 +66,8 @@ const CreditHistoryQuerySchema = z.object({
     .optional()
 });
 const ChannelOpSchema = z.object({
-  nonce: z.string().regex(/^\d+$/).optional(),
-  signature: z
-    .string()
-    .regex(/^0x[0-9a-fA-F]+$/)
-    .optional()
+  nonce: z.string().regex(/^\d+$/),
+  signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
 const AnalyticsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30)
@@ -134,8 +122,22 @@ export default {
       bridgeEnabled: antseedFundingVault.enabled
     });
 
-    const summary = await creditStreams(cfg, env.ANTSEED_KV, store, antseedFundingVault, ctx);
-    logInfo("cron.summary", { ...summary, elapsedMs: Date.now() - startedAt });
+    try {
+      const summary = await creditStreams(cfg, env.ANTSEED_KV, store, antseedFundingVault, ctx);
+      logInfo("cron.summary", { ...summary, elapsedMs: Date.now() - startedAt });
+    } catch (error) {
+      logError("cron.streams.failed", {
+        message: errorMessage(error)
+      });
+      ctx.waitUntil(
+        notifySlackOnRequestError(env, {
+          method: "SCHEDULED",
+          path: "creditStreams",
+          body: undefined,
+          message: errorMessage(error)
+        })
+      );
+    }
 
     try {
       const summaries = await backFillAnalytics(env, ANALYTICS_CRON_BACKFILL_DAYS);
@@ -240,8 +242,8 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
         429
       );
     }
-    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
     const summaries = await backFillAnalytics(env);
+    await env.ANTSEED_KV.put(ANALYTICS_REFRESH_LAST_RUN_KEY, String(now));
     return json(summaries);
   }
 
@@ -316,7 +318,7 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
           gdAmountWei: event.gdAmountWei,
           txHash: event.txHash,
           logIndex: event.logIndex,
-          isVerified: isValidForBonus, // if root acccount was found it is whitelisted & operator set
+          isVerified: isValidForBonus, // if root account was found it is whitelisted & operator set
           gdPrice,
           maxBonusCapUsd: cfg.MAX_BONUS_CAP_USD,
           regularBonusBps: cfg.REGULAR_BONUS_BPS,
@@ -473,10 +475,10 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     logInfo("channel.request", {
       action,
       channelId: redactHash(channelId),
-      hasNonce: nonce !== undefined,
-      hasSignature: Boolean(signature)
+      hasNonce: true,
+      hasSignature: true
     });
-    const parsedNonce = nonce === undefined ? undefined : BigInt(nonce);
+    const parsedNonce = BigInt(nonce);
     const bridge =
       action === "close"
         ? await antseedFundingVault.requestClose(channelId, parsedNonce, signature)

@@ -235,7 +235,7 @@ test("config values exposes non-secret runtime constants", async () => {
     };
   };
   assert.equal(body.config.GD_CUSD_PRICE, 0.0001);
-  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000000000000000");
+  assert.equal(body.config.MAX_BONUS_CAP_USD, "100000000");
   assert.equal(body.config.REGULAR_BONUS_BPS, "1000");
   assert.equal(body.config.STREAMING_BONUS_BPS, "2000");
   assert.equal(body.config.MIN_STREAM_BONUS_WEI, "4000000000000000000000");
@@ -984,7 +984,7 @@ test("analytics refresh collects logs beyond the explorer 1000-result cap", { co
 
 const CHANNEL_ID = `0x${"a".repeat(64)}`;
 
-test("POST /v1/channels/:channelId/close returns enabled:false when vault not configured", async () => {
+test("POST /v1/channels/:channelId/close rejects missing nonce or signature", async () => {
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
       method: "POST",
@@ -994,14 +994,10 @@ test("POST /v1/channels/:channelId/close returns enabled:false when vault not co
     env(),
     makeExecutionContext()
   );
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
-  assert.equal(body.channelId, CHANNEL_ID);
-  assert.equal(body.action, "close");
-  assert.equal(body.bridge.enabled, false);
+  assert.equal(res.status, 400);
 });
 
-test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not configured", async () => {
+test("POST /v1/channels/:channelId/withdraw rejects missing nonce or signature", async () => {
   const res = await worker.fetch(
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/withdraw`, {
       method: "POST",
@@ -1011,26 +1007,40 @@ test("POST /v1/channels/:channelId/withdraw returns enabled:false when vault not
     env(),
     makeExecutionContext()
   );
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
-  assert.equal(body.channelId, CHANNEL_ID);
-  assert.equal(body.action, "withdraw");
-  assert.equal(body.bridge.enabled, false);
+  assert.equal(res.status, 400);
 });
 
-test("POST /v1/channels/:channelId/close with optional sig fields passes validation", async () => {
-  const res = await worker.fetch(
+test("POST /v1/channels/:channelId/close and withdraw require nonce and signature and return enabled:false when vault not configured", async () => {
+  const validPayload = { nonce: "0", signature: `0x${"b".repeat(130)}` };
+  const closeRes = await worker.fetch(
     new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/close`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ nonce: "0", signature: `0x${"b".repeat(130)}` })
+      body: JSON.stringify(validPayload)
     }),
     env(),
     makeExecutionContext()
   );
-  assert.equal(res.status, 200);
-  const body = (await res.json()) as { bridge: { enabled: boolean } };
-  assert.equal(body.bridge.enabled, false);
+  assert.equal(closeRes.status, 200);
+  const closeBody = (await closeRes.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
+  assert.equal(closeBody.channelId, CHANNEL_ID);
+  assert.equal(closeBody.action, "close");
+  assert.equal(closeBody.bridge.enabled, false);
+
+  const withdrawRes = await worker.fetch(
+    new Request(`https://worker.test/v1/channels/${CHANNEL_ID}/withdraw`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(validPayload)
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(withdrawRes.status, 200);
+  const withdrawBody = (await withdrawRes.json()) as { channelId: string; action: string; bridge: { enabled: boolean } };
+  assert.equal(withdrawBody.channelId, CHANNEL_ID);
+  assert.equal(withdrawBody.action, "withdraw");
+  assert.equal(withdrawBody.bridge.enabled, false);
 });
 
 test("POST /v1/channels/:channelId/close rejects invalid signature format", async () => {

@@ -16,6 +16,23 @@ const STREAM_CREDIT_COOLDOWN_SECONDS = 24 * 60 * 60;
  */
 const STREAM_CLOSED_PERIODS_CURSOR_KEY = "streams:closed-periods-cursor";
 
+/**
+ * Credit every account streaming into the vault for the G$ its stream periods carried since its last
+ * credit, and sync each account's recorded flow rate. The only path that credits streams.
+ *
+ * Each account is owed `streamOwedWei(periods, lastStreamCreditAt, asOf)`: every constant-rate period
+ * times its overlap with the uncredited window. That prices rate changes, closes and re-opens exactly,
+ * with no remembered rate or stream "last update" to go stale. `asOf` is the subgraph's indexed head,
+ * not wall-clock time, so the window never runs past what the subgraph has seen.
+ *
+ * The deposit id is the window's start (`stream:<account>:<creditedThrough>`). Two runs that overlap
+ * read the same clock, derive the same id and are funded once: `depositForWithId` dedupes on it.
+ *
+ * Live streams are gated by a 24h cooldown -- aged from the window's own start, so a first-time or
+ * reopened stream is held like any other -- and by `MIN_STREAM_BONUS_WEI`. An account whose streams have
+ * all closed is settled in full regardless, so its final tail is paid out and the closed-periods
+ * cursor can move past it.
+ */
 export async function creditStreams(
   cfg: RuntimeConfig,
   kv: KVNamespace,

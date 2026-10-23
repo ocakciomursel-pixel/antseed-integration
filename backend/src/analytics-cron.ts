@@ -1,5 +1,6 @@
 import { Env } from "./env.js";
 import { runAnalyticsAggregation } from "./analytics.js";
+import { logInfo } from "./logging.js";
 
 export const ANALYTICS_REFRESH_COOLDOWN_MS = 60 * 60 * 1000;
 export const ANALYTICS_REFRESH_LAST_RUN_KEY = "analytics:refresh:last-run-at";
@@ -18,10 +19,10 @@ export async function backFillAnalytics(env: Env, maxRunsPerTick = 2) {
   }
   // TODO: replace bounded loop with persisted backfill cursor when we need broader historical catch-up.
   for (let i = 0; i < maxRunsPerTick; i += 1) {
-    console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate}`);
+    logInfo("analytics.backfill.run.start", { run: i + 1, maxRunsPerTick, cursorDate });
     const aggregationRunAt = cursorDate === todayDate ? runAt : new Date(`${cursorDate}T23:59:59.999Z`);
     const analyticsSummary = await runAnalyticsAggregation(env, aggregationRunAt);
-    console.log(`analytics backfill run ${i + 1} of ${maxRunsPerTick}, cursorDate=${cursorDate} completed`, analyticsSummary);
+    logInfo("analytics.backfill.run.completed", { run: i + 1, maxRunsPerTick, cursorDate, currentDate: analyticsSummary.currentDate });
     summaries.push({
       currentDate: analyticsSummary.currentDate,
       finalizedDates: analyticsSummary.finalizedDates

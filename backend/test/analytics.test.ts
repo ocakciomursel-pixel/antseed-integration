@@ -253,3 +253,103 @@ test("runAnalyticsAggregation calculates streamed G$ for streams active since be
     globalThis.fetch = originalFetch;
   }
 });
+
+
+test("getAnalyticsWindow includes unfinalized middle days in global totals and finalizeClosedDays continues past missing days", async () => {
+  const testEnv = env();
+  const now = new Date("2026-07-24T12:00:00.000Z");
+
+  // 2026-07-21 is finalized ($100 wei deposits)
+  await testEnv.ANTSEED_KV.put(
+    "analytics:global",
+    JSON.stringify({
+      gdOneTimeDepositsWei: "100",
+      gdStreamedWei: "0",
+      aiCreditsUsedWei: "0",
+      gdTotalFlowRateWeiPerSecond: "0",
+      updatedAt: "2026-07-21T23:59:59.000Z"
+    })
+  );
+  await testEnv.ANTSEED_KV.put(
+    "analytics:state",
+    JSON.stringify({
+      finalizedThroughDate: "2026-07-21",
+      updatedAt: "2026-07-21T23:59:59.000Z"
+    })
+  );
+
+  // 2026-07-22 is missing, 2026-07-23 is present (200 wei), 2026-07-24 is today (50 wei)
+  await testEnv.ANTSEED_KV.put(
+    "analytics:daily:2026-07-23",
+    JSON.stringify({
+      date: "2026-07-23",
+      gdOneTimeDepositsWei: "200",
+      gdStreamedWei: "0",
+      gdTotalFlowRateWeiPerSecond: "0",
+      aiCreditsUsedWei: "0",
+      uniqueGdBuyers: 1,
+      uniqueCreditUsers: 0,
+      updatedAt: "2026-07-23T23:59:59.000Z"
+    })
+  );
+  await testEnv.ANTSEED_KV.put(
+    "analytics:daily:2026-07-24",
+    JSON.stringify({
+      date: "2026-07-24",
+      gdOneTimeDepositsWei: "50",
+      gdStreamedWei: "0",
+      gdTotalFlowRateWeiPerSecond: "10",
+      aiCreditsUsedWei: "0",
+      uniqueGdBuyers: 1,
+      uniqueCreditUsers: 0,
+      updatedAt: "2026-07-24T12:00:00.000Z"
+    })
+  );
+
+  // Before finalization runs, getAnalyticsWindow still sums unfinalized middle day (2026-07-23) + today (2026-07-24)
+  const beforeFinalize = await getAnalyticsWindow(testEnv, 4, now);
+  assert.equal(beforeFinalize.global.gdOneTimeDepositsWei, "350");
+  assert.equal(beforeFinalize.global.gdTotalFlowRateWeiPerSecond, "10");
+});
+
+test("runAnalyticsAggregation retries HTTP 500 from subgraph before succeeding", { concurrency: false }, async () => {
+  const testEnv = env({
+    CELO_VAULT_ADDRESS: "0x4Dd0136b9aabD5823cf0F65d89e8fB882C660885",
+    CELO_GD_SUPERTOKEN_ADDRESS: "0x62B8B11039FcfE5aB0C56E502b1C372A3d2a9c7A",
+    CELO_BLOCKSCOUT_API_URL: "https://celo.blockscout.test/api",
+    BASE_BLOCKSCOUT_API_URL: "https://base.blockscout.test/api",
+    ANTSEED_CHANNELS_ADDRESS: "0xba66d3b4fbcf472f6f11d6f9f96aace96516f09d",
+    SUPERFLUID_SUBGRAPH_URL: "https://superfluid.test/subgraph"
+  });
+
+  const now = new Date("2026-07-24T12:00:00.000Z");
+  const dayStartUnix = Math.floor(new Date("2026-07-24T00:00:00.000Z").getTime() / 1000);
+  const dayEndUnix = dayStartUnix + 24 * 60 * 60 - 1;
+  let subgraphAttempts = 0;
+
+  const baseMock = buildOfflineAnalyticsFetchMock({
+    dayStartUnix,
+    dayEndUnix,
+    streamPeriods: []
+  });
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (urlInput: string | URL | Request, init?: RequestInit) => {
+      const url = typeof urlInput === "string" ? new URL(urlInput) : urlInput instanceof URL ? urlInput : new URL(urlInput.url);
+      if (url.host === "superfluid.test") {
+        subgraphAttempts += 1;
+        if (subgraphAttempts === 1) {
+          return new Response("Internal Server Error", { status: 500 });
+        }
+      }
+      return baseMock(urlInput as never, init);
+    }) as typeof fetch;
+
+    const summary = await runAnalyticsAggregation(testEnv, now);
+    assert.equal(summary.ok, true);
+    assert.equal(subgraphAttempts, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

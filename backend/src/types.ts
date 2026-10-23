@@ -1,23 +1,3 @@
-export type ChatMessage = {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string;
-};
-
-export type CreditReservation = {
-  requestId: string;
-  account: string;
-  rootAccount?: string;
-  maxCostUsd: string;
-  status: "reserved" | "settled" | "released";
-  actualCostUsd?: string;
-  providerReceiptHash?: string;
-  vaultReserveTxHash?: string;
-  vaultSettleTxHash?: string;
-  vaultReleaseTxHash?: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
 export type UserCreditProfile = {
   account: string;
   rootAccount: string;
@@ -52,17 +32,4 @@ export type GdCreditEntry = {
   buyerAddress?: string;
   /** End of the stream window this entry pays for; becomes the account's `lastStreamCreditAt` once funded. */
   streamCreditedThrough?: string;
-};
-
-export type StreamState = {
-  account: string;
-  rootAccount: string;
-  flowRateWeiPerSecond: string;
-  monthlyGdAmountWei: string;
-  monthlyUsd: string;
-  active: boolean;
-  lastBonusPaidAt: string;
-  txHash?: string;
-  logIndex?: number;
-  updatedAt: string;
 };

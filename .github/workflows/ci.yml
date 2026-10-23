@@ -36,6 +36,9 @@ jobs:
       - name: Install
         working-directory: backend
         run: yarn install --immutable
+      - name: Typecheck
+        working-directory: backend
+        run: yarn run typecheck
       - name: Worker-only backend guard
         working-directory: backend
         run: yarn run check:worker-only

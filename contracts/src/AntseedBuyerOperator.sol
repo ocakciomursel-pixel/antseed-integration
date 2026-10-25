@@ -147,6 +147,10 @@ contract AntseedBuyerOperator is Initializable, UUPSUpgradeable {
         emit BuyerOperatorAccepted(buyer, nonce);
     }
 
+    function getBuyerOperator(address buyer) external view returns (address) {
+        return _deposits().getOperator(buyer);
+    }
+
     function _accountForUsage(address buyer) internal {
         (uint256 available, uint256 reserved, ) = _deposits().getBuyerBalance(buyer);
         uint256 currentBalance = available + reserved;

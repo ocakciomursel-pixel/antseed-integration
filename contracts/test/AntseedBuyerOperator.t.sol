@@ -949,9 +949,30 @@ contract AntseedBuyerOperatorTest {
     function testTransferBuyerOperatorWorks() public {
         setUp();
         operator.acceptBuyerOperator(buyer, 1, "");
+        require(operator.getBuyerOperator(buyer) == address(operator), "operator recorded");
         address newOp = address(0xC0DE);
         operator.transferBuyerOperator(buyer, newOp);
         require(deposits.getOperator(buyer) == newOp, "operator transferred");
+        require(operator.getBuyerOperator(buyer) == newOp, "getBuyerOperator reflects transfer");
+    }
+
+    function testTransferBuyerOperatorToZeroResetsOperatorAndRejectsBonusOnlyDeposit() public {
+        setUp();
+        usdc.mint(address(operator), 100_000_000);
+        operator.acceptBuyerOperator(buyer, 1, "");
+        require(operator.getBuyerOperator(buyer) == address(operator), "operator initially active");
+
+        operator.transferBuyerOperator(buyer, address(0));
+        require(deposits.getOperator(buyer) == address(0), "operator reset to zero in deposits");
+        require(operator.getBuyerOperator(buyer) == address(0), "getBuyerOperator returns zero after reset");
+
+        bool ok;
+        try operator.depositForWithId(buyer, 0, 100_000, "tx:after-reset") {
+            ok = true;
+        } catch {
+            ok = false;
+        }
+        require(!ok, "bonus-only deposit rejected after operator reset to zero");
     }
 
     function testTransferBuyerOperatorOnlyAdmin() public {

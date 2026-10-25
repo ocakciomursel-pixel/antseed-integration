@@ -1115,6 +1115,76 @@ test("POST /v1/accounts/:account/operator-revoke returns enabled:false when vaul
   assert.equal(body.bridge.nonce, "0");
 });
 
+test("POST /v1/accounts/:buyer/operator-reset returns 400 on invalid buyer address", async () => {
+  const res = await worker.fetch(
+    new Request("https://worker.test/v1/accounts/not-an-address/operator-reset", {
+      method: "POST"
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 400);
+});
+
+test("POST /v1/accounts/:buyer/operator-reset returns enabled:false when vault not configured", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const res = await worker.fetch(
+    new Request(`https://worker.test/v1/accounts/${buyer}/operator-reset`, {
+      method: "POST"
+    }),
+    env(),
+    makeExecutionContext()
+  );
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { buyer: string; bridge: { enabled: boolean; buyer: string; operator: string } };
+  assert.equal(body.buyer, buyer);
+  assert.equal(body.bridge.enabled, false);
+  assert.equal(body.bridge.buyer, buyer);
+  assert.equal(body.bridge.operator, "0x0000000000000000000000000000000000000000");
+});
+
+test("POST /v1/accounts/:buyer/operator-reset submits transferBuyerOperator to address(0) when configured", { concurrency: false }, async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const txHash = `0x${"c".repeat(64)}`;
+  const originalTransfer = AntSeedFundingVaultClient.prototype.transferBuyerOperator;
+
+  let transferredBuyer = "";
+  let transferredOperator = "";
+  try {
+    AntSeedFundingVaultClient.prototype.transferBuyerOperator = async function (targetBuyer: string, newOperator: string) {
+      transferredBuyer = targetBuyer;
+      transferredOperator = newOperator;
+      return {
+        enabled: true,
+        buyer: targetBuyer.toLowerCase(),
+        operator: newOperator.toLowerCase(),
+        txHash
+      };
+    };
+
+    const res = await worker.fetch(
+      new Request(`https://worker.test/v1/accounts/${buyer.toUpperCase().replace("0X", "0x")}/operator-reset`, {
+        method: "POST"
+      }),
+      env(),
+      makeExecutionContext()
+    );
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as {
+      buyer: string;
+      bridge: { enabled: boolean; buyer: string; operator: string; txHash?: string };
+    };
+    assert.equal(transferredBuyer, buyer);
+    assert.equal(transferredOperator, "0x0000000000000000000000000000000000000000");
+    assert.equal(body.buyer, buyer);
+    assert.equal(body.bridge.enabled, true);
+    assert.equal(body.bridge.operator, "0x0000000000000000000000000000000000000000");
+    assert.equal(body.bridge.txHash, txHash);
+  } finally {
+    AntSeedFundingVaultClient.prototype.transferBuyerOperator = originalTransfer;
+  }
+});
+
 test("POST /v1/accounts/:account/withdraw returns 400 on missing body fields", async () => {
   const account = "0x0000000000000000000000000000000000000abc";
   const res = await worker.fetch(
@@ -1533,6 +1603,118 @@ test("fundCredit deposits bonus-only credits when buyer still uses operator", as
   assert.equal(profile.totalOutstandingFundingUsd, "0");
   assert.equal(profile.totalBonusUsd, "40");
   assert.deepEqual(result.bridge, { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "40", txHash: "0xfunded" });
+});
+
+test("fundCredit rejects deposit and marks funding failed when service is no longer the buyer operator", async () => {
+  const account = "0x0000000000000000000000000000000000000abc";
+  const buyer = "0x0000000000000000000000000000000000000aaa";
+  const kv = new MemoryKV();
+  const store = new KVCreditStore(kv as never);
+  const entry: GdCreditEntry = {
+    id: "deposit:stale-operator:test",
+    account: account.toLowerCase(),
+    rootAccount: account.toLowerCase(),
+    source: "deposit",
+    gdAmountWei: "1000000000000000000",
+    principalUsd: "100",
+    bonusUsd: "10",
+    totalCreditUsd: "110",
+    fundingStatus: "pending",
+    createdAt: new Date().toISOString(),
+    streamUpdateMonth: "2026-08",
+    buyerAddress: buyer.toLowerCase()
+  };
+  await kv.put("gd-credit:deposit:stale-operator:test", JSON.stringify(entry));
+  await kv.put(`user:${account.toLowerCase()}`, JSON.stringify({ account: account.toLowerCase(), totalOutstandingFundingUsd: "110" }));
+
+  let depositCalls = 0;
+  const vault = {
+    enabled: true,
+    async isBuyerOperator() {
+      return {
+        enabled: true,
+        buyer: buyer.toLowerCase(),
+        operator: "0x0000000000000000000000000000000000000000",
+        isOperator: false
+      };
+    },
+    async depositForBuyerWithId() {
+      depositCalls += 1;
+      return { enabled: true, buyer: buyer.toLowerCase(), amountUsd: "110", txHash: "0xshouldnot" };
+    }
+  };
+
+  const result = await fundCredit(entry, store, vault as never);
+  const updatedEntry = (await kv.get("gd-credit:deposit:stale-operator:test", "json")) as GdCreditEntry;
+  const profile = (await kv.get(`user:${account.toLowerCase()}`, "json")) as {
+    totalOutstandingFundingUsd: string;
+    totalPrincipalUsd: string;
+    totalBonusUsd: string;
+  };
+
+  assert.equal(depositCalls, 0);
+  assert.equal(updatedEntry.fundingStatus, "failed");
+  assert.equal(updatedEntry.fundingError, "buyer operator is not configured for funding");
+  assert.equal(profile.totalOutstandingFundingUsd, "0");
+  assert.equal(profile.totalPrincipalUsd, "0");
+  assert.equal(profile.totalBonusUsd, "0");
+  assert.deepEqual(result.bridge, {
+    enabled: true,
+    buyer: buyer.toLowerCase(),
+    amountUsd: "110",
+    error: "buyer operator is not configured for funding"
+  });
+});
+
+test("AntSeedFundingVaultClient.getBuyerOperator reads getBuyerOperator and resets to address(0)", async () => {
+  const buyer = "0x0000000000000000000000000000000000000abc";
+  const vaultAddress = "0x0000000000000000000000000000000000000b01";
+  let currentOperator = vaultAddress;
+  const transferredCalls: Array<{ buyer: string; newOperator: string }> = [];
+
+  const client = new AntSeedFundingVaultClient({
+    ANTSEED_FUNDING_VAULT_ADDRESS: vaultAddress
+  } as never);
+  Object.assign(client, {
+    enabled: true,
+    contract: {
+      async getAddress() {
+        return vaultAddress;
+      },
+      async getBuyerOperator(targetBuyer: string) {
+        assert.equal(targetBuyer, buyer);
+        return currentOperator;
+      },
+      async transferBuyerOperator(targetBuyer: string, newOperator: string) {
+        transferredCalls.push({ buyer: targetBuyer, newOperator });
+        currentOperator = newOperator;
+        return {
+          async wait() {
+            return { hash: "0xresettx" };
+          }
+        };
+      }
+    }
+  });
+
+  const active = await client.getBuyerOperator(buyer);
+  assert.equal(active.enabled, true);
+  assert.equal(active.buyer, buyer);
+  assert.equal(active.operator, vaultAddress.toLowerCase());
+  assert.equal(active.isOperator, true);
+
+  const resetResult = await client.resetBuyerOperator(buyer);
+  assert.deepEqual(transferredCalls, [
+    { buyer, newOperator: "0x0000000000000000000000000000000000000000" }
+  ]);
+  assert.equal(resetResult.enabled, true);
+  assert.equal(resetResult.operator, "0x0000000000000000000000000000000000000000");
+  assert.equal(resetResult.txHash, "0xresettx");
+
+  const afterReset = await client.getBuyerOperator(buyer);
+  assert.equal(afterReset.enabled, true);
+  assert.equal(afterReset.operator, "0x0000000000000000000000000000000000000000");
+  assert.equal(afterReset.isOperator, false);
 });
 
 // The subgraph is the source of truth for whether a stream still exists. A closed stream reports

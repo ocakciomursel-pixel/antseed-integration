@@ -41,6 +41,19 @@ export async function fundCredit(
   });
   try {
     const shouldCredit = principalUsd + bonusUsd > 0n;
+    if (shouldCredit && antseedFundingVault.enabled && typeof antseedFundingVault.isBuyerOperator === "function") {
+      const operatorStatus = await antseedFundingVault.isBuyerOperator(buyer);
+      if (operatorStatus.enabled && !operatorStatus.isOperator) {
+        logWarn("funding.operator.not-active", {
+          entryId: entry.id,
+          source: entry.source,
+          account: redactAddress(entry.account),
+          buyer: redactAddress(buyer),
+          operator: redactAddress(operatorStatus.operator)
+        });
+        throw new Error("buyer operator is not configured for funding");
+      }
+    }
     const bridge = shouldCredit
       ? await antseedFundingVault.depositForBuyerWithId(buyer, principalUsd, bonusUsd, entry.id)
       : { enabled: antseedFundingVault.enabled, buyer, amountUsd: "0" };

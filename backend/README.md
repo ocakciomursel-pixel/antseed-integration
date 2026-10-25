@@ -22,6 +22,7 @@ Cloudflare Worker for GoodDollar Celo-vault credit accounting and Celo → Base 
 - `POST /v1/analytics/refresh`
 - `POST /v1/accounts/:account/operator-consent`
 - `POST /v1/accounts/:account/operator-revoke`
+- `POST /v1/accounts/:account/operator-reset`
 - `POST /v1/accounts/:account/withdraw`
 - `POST /v1/celo/events/record`
 - `POST /v1/channels/:channelId/close`

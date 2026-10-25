@@ -105,6 +105,10 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 - body: `nonce`, buyer EIP-712 `signature`
 - calls `AntseedBuyerOperator.revokeOperator(buyer, nonce, buyerSig)`
 
+**Operator reset** (`POST /v1/accounts/:account/operator-reset`):
+
+- validates `:account` buyer address; no buyer signature is required because the configured operator admin/owner initiates `AntseedBuyerOperator.transferBuyerOperator(buyer, address(0))`
+
 **Channel close** (`POST /v1/channels/:channelId/close`):
 
 - optional buyer EIP-712 `RequestClose` (`nonce`, `signature`) or operator-as-owner when unsigned
@@ -117,6 +121,7 @@ The backend is a Cloudflare Worker managed by Wrangler. Its current scope is G$ 
 
 **Funding path** (`fundCredit`):
 
+- verifies via `AntSeedFundingVaultClient.isBuyerOperator(buyer)` that the configured `AntseedBuyerOperator` wrapper is still the buyer's active operator before submitting any on-chain deposit
 - calls `AntSeedFundingVaultClient.depositForBuyerWithId(buyer, principal, bonus, id)` — uses the `buyer` from the credit entry, or falls back to `account`
 - on success: marks entry `funded`, credits the profile's lifetime totals, decrements `totalOutstandingFundingUsd`
 - on failure: marks entry `failed`, preserves `fundingError`, leaves the lifetime totals untouched, and

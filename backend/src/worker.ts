@@ -60,6 +60,7 @@ const OperatorConsentSchema = z.object({
   nonce: z.string().regex(/^\d+$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]+$/)
 });
+const BuyerAddressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 const CreditHistoryQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(20),
   offset: z.coerce.number().int().min(0).default(0),
@@ -431,6 +432,25 @@ async function route(request: Request, env: Env, _ctx: ExecutionContext): Promis
     logInfo("operator.revoke.result", {
       buyer: redactAddress(buyer),
       enabled: bridge.enabled,
+      txHash: redactHash(bridge.txHash)
+    });
+    return json({ buyer, bridge });
+  }
+
+  const operatorResetMatch = url.pathname.match(/^\/v1\/accounts\/([^/]+)\/operator-reset$/);
+  if (request.method === "POST" && operatorResetMatch) {
+    const rawBuyer = decodeURIComponent(operatorResetMatch[1]);
+    const parsedBuyer = BuyerAddressSchema.safeParse(rawBuyer);
+    if (!parsedBuyer.success) return json({ error: parsedBuyer.error.flatten() }, 400);
+    const buyer = parsedBuyer.data.toLowerCase();
+    logInfo("operator.reset.request", {
+      buyer: redactAddress(buyer)
+    });
+    const bridge = await antseedFundingVault.resetBuyerOperator(buyer);
+    logInfo("operator.reset.result", {
+      buyer: redactAddress(buyer),
+      enabled: bridge.enabled,
+      operator: redactAddress(bridge.operator),
       txHash: redactHash(bridge.txHash)
     });
     return json({ buyer, bridge });

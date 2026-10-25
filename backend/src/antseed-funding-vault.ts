@@ -7,6 +7,8 @@ const FUNDING_VAULT_ABI = [
   "function depositForWithId(address buyer, uint256 principal, uint256 bonus, string id)",
   "function acceptBuyerOperator(address buyer, uint256 nonce, bytes buyerSig)",
   "function revokeOperator(address buyer, uint256 nonce, bytes buyerSig)",
+  "function transferBuyerOperator(address buyer, address newOperator)",
+  "function getBuyerOperator(address buyer) view returns (address)",
   "function withdrawPrincipal(address buyer, uint256 amount, address recipient, uint256 nonce, bytes buyerSig)",
   "function requestClose(bytes32 channelId, uint256 nonce, bytes buyerSig)",
   "function withdrawChannel(bytes32 channelId, uint256 nonce, bytes buyerSig)",
@@ -46,6 +48,10 @@ export class AntSeedFundingVaultClient {
     });
   }
 
+  get vaultAddress(): string | undefined {
+    return this.cfg.ANTSEED_FUNDING_VAULT_ADDRESS?.toLowerCase();
+  }
+
   async acceptBuyerOperator(buyer: string, nonce: bigint, signature: string): Promise<{ enabled: boolean; buyer: string; nonce: string; txHash?: string }> {
     const normalizedBuyer = buyer.toLowerCase();
     if (!this.contract) {
@@ -74,6 +80,29 @@ export class AntSeedFundingVaultClient {
       nonce: nonce.toString(),
       txHash: receipt?.hash
     };
+  }
+
+  async transferBuyerOperator(
+    buyer: string,
+    newOperator: string
+  ): Promise<{ enabled: boolean; buyer: string; operator: string; txHash?: string }> {
+    const normalizedBuyer = buyer.toLowerCase();
+    const normalizedOperator = newOperator.toLowerCase();
+    if (!this.contract) {
+      return { enabled: false, buyer: normalizedBuyer, operator: normalizedOperator };
+    }
+    const tx = await this.contract.transferBuyerOperator(normalizedBuyer, normalizedOperator);
+    const receipt = await tx.wait();
+    return {
+      enabled: true,
+      buyer: normalizedBuyer,
+      operator: normalizedOperator,
+      txHash: receipt?.hash
+    };
+  }
+
+  async resetBuyerOperator(buyer: string): Promise<{ enabled: boolean; buyer: string; operator: string; txHash?: string }> {
+    return this.transferBuyerOperator(buyer, ethers.ZeroAddress);
   }
 
   async depositForBuyer(buyer: string, principalUsd: bigint, bonusUsd: bigint): Promise<AntSeedFundingResult> {
@@ -152,21 +181,43 @@ export class AntSeedFundingVaultClient {
     }
   }
 
-  async isBuyerOperator(buyer: string): Promise<{ enabled: boolean; buyer: string; isOperator: boolean }> {
-    const normalizedBuyer = buyer.toLowerCase();
-    if (!this.contract) return { enabled: false, buyer: normalizedBuyer, isOperator: false };
-
-    const operatorAddress = await this.contract.getAddress();
+  private async readBuyerOperatorAddress(normalizedBuyer: string): Promise<string> {
+    if (!this.contract) return ethers.ZeroAddress;
+    try {
+      const directOperator = await this.contract.getBuyerOperator(normalizedBuyer);
+      if (directOperator) {
+        return String(directOperator).toLowerCase();
+      }
+    } catch {
+      // Fall back to reading via registry().deposits().getOperator(buyer) when the deployed proxy
+      // does not expose getBuyerOperator(address).
+    }
     const registryAddress = await this.contract.registry();
     const registry = new ethers.Contract(registryAddress, REGISTRY_ABI, this.contract.runner);
     const depositsAddress = await registry.deposits();
     const deposits = new ethers.Contract(depositsAddress, DEPOSITS_ABI, this.contract.runner);
     const currentOperator = await deposits.getOperator(normalizedBuyer);
+    return String(currentOperator).toLowerCase();
+  }
+
+  async getBuyerOperator(buyer: string): Promise<{ enabled: boolean; buyer: string; operator?: string; isOperator: boolean }> {
+    const normalizedBuyer = buyer.toLowerCase();
+    if (!this.contract) return { enabled: false, buyer: normalizedBuyer, isOperator: false };
+
+    const [operatorAddress, currentOperator] = await Promise.all([
+      this.vaultAddress ?? this.contract.getAddress(),
+      this.readBuyerOperatorAddress(normalizedBuyer)
+    ]);
     return {
       enabled: true,
       buyer: normalizedBuyer,
-      isOperator: String(currentOperator).toLowerCase() === String(operatorAddress).toLowerCase()
+      operator: currentOperator,
+      isOperator: currentOperator === String(operatorAddress).toLowerCase()
     };
+  }
+
+  async isBuyerOperator(buyer: string): Promise<{ enabled: boolean; buyer: string; operator?: string; isOperator: boolean }> {
+    return this.getBuyerOperator(buyer);
   }
 
   async withdrawPrincipalForBuyer(
